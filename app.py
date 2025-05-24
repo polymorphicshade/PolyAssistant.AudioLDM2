@@ -1,10 +1,15 @@
 from huggingface_hub import hf_hub_download
 import torch
 import os
-
 import gradio as gr
 from audioldm2 import text_to_audio, build_model
 from share_btn import community_icon_html, loading_icon_html, share_js
+from flask import Flask, request, jsonify, send_file # Import send_file
+import threading
+import io # Import io for BytesIO
+from scipy.io.wavfile import write as write_wav # Import write for WAV files
+import numpy as np # Import numpy for array manipulation
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -44,14 +49,18 @@ def text2audio(
         guidance_scale=guidance_scale,
         n_candidate_gen_per_text=int(n_candidates),
         latent_t_per_second=latent_t_per_second,
-    )  # [bs, 1, samples]
-    waveform = [
+    )   # [bs, 1, samples]
+
+    # For Gradio UI, we need to convert to the format Gradio expects for video/audio display
+    gradio_output_waveform = [
         gr.make_waveform((sample_rate, wave[0]), bg_image="bg.png") for wave in waveform
     ]
-    # waveform = [(16000, np.random.randn(16000)), (16000, np.random.randn(16000))]
-    if len(waveform) == 1:
-        waveform = waveform[0]
-    return waveform
+    if len(gradio_output_waveform) == 1:
+        gradio_output_waveform = gradio_output_waveform[0]
+
+    # Return both the raw waveform data and the Gradio-compatible waveform
+    return waveform, sample_rate, gradio_output_waveform
+
 
 def share_js():
     # Your JavaScript code goes here
@@ -194,6 +203,59 @@ css = """
           font-weight: 900;
         }
 """
+
+# Initialize Flask app
+app = Flask(__name__)
+
+@app.route('/generate_audio', methods=['POST'])
+def generate_audio_api():
+    data = request.json
+    text = data.get('text')
+    duration = data.get('duration', 10)
+    guidance_scale = data.get('guidance_scale', 3.5)
+    random_seed = data.get('random_seed', 45)
+    n_candidates = data.get('n_candidates', 1) # Set to 1 for API to return a single audio
+    model_name = data.get('model_name', default_checkpoint)
+
+    if not text:
+        return jsonify({"error": "Missing 'text' parameter"}), 400
+
+    try:
+        # Call text2audio. It now returns raw_waveform, sample_rate, and gradio_output_waveform
+        raw_waveforms, sample_rate, _ = text2audio(
+            text=text,
+            duration=duration,
+            guidance_scale=guidance_scale,
+            random_seed=random_seed,
+            n_candidates=n_candidates,
+            model_name=model_name
+        )
+
+        # Assuming text2audio returns a list of waveforms, take the first one for the API
+        # Each waveform in the list is expected to be [1, samples]
+        audio_data = raw_waveforms[0][0] # Access the numpy array for audio data
+
+        # Convert the audio data to a format suitable for WAV (e.g., int16)
+        # Scale to -32767 to 32767 for int16 representation if it's float
+        if audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
+            audio_data = (audio_data * 32767).astype(np.int16)
+
+        # Create an in-memory binary stream
+        byte_io = io.BytesIO()
+        write_wav(byte_io, sample_rate, audio_data)
+        byte_io.seek(0) # Rewind the stream to the beginning
+
+        return send_file(
+            byte_io,
+            mimetype='audio/wav',
+            as_attachment=True,
+            download_name='generated_audio.wav'
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Gradio UI setup (remains largely the same)
 iface = gr.Blocks(css=css)
 
 with iface:
@@ -260,19 +322,11 @@ with iface:
                     label="Automatic quality control. This number control the number of candidates (e.g., generate three audios and choose the best to show you). A Larger value usually lead to better quality with heavier computation",
                 )
                 model_name = gr.Dropdown(
-                      ["audioldm_48k", "audioldm_crossattn_flant5", "audioldm2-full"], value="audioldm_48k",
-                  )
+                    ["audioldm_48k", "audioldm_crossattn_flant5", "audioldm2-full"], value="audioldm_48k",
+                )
             ############# Output
-            # outputs=gr.Audio(label="Output", type="numpy")
             outputs = gr.Video(label="Output", elem_id="output-video")
 
-            # with gr.Group(elem_id="container-advanced-btns"):
-            #   # advanced_button = gr.Button("Advanced options", elem_id="advanced-btn")
-            #   with gr.Group(elem_id="share-btn-container"):
-            #     community_icon = gr.HTML(community_icon_html, visible=False)
-            #     loading_icon = gr.HTML(loading_icon_html, visible=False)
-            #     share_button = gr.Button("Share to community", elem_id="share-btn", visible=False)
-            # outputs=[gr.Audio(label="Output", type="numpy"), gr.Audio(label="Output", type="numpy")]
             btn = gr.Button("Submit")
             btn.css_class = "gr-btn-full-width"
 
@@ -281,17 +335,13 @@ with iface:
             loading_icon = gr.HTML(loading_icon_html)
             share_button = gr.Button("Share to community", elem_id="share-btn")
 
-        # btn.click(text2audio, inputs=[
-        #           textbox, duration, guidance_scale, seed, n_candidates, model_name], outputs=[outputs])
+        # Gradio button click now needs to handle the multiple returns from text2audio
         btn.click(
-            text2audio,
-            inputs=[textbox, duration, guidance_scale, seed, n_candidates],
+            lambda *args: text2audio(*args)[2], # Only pass the gradio_output_waveform to Gradio UI
+            inputs=[textbox, duration, guidance_scale, seed, n_candidates, model_name],
             outputs=[outputs],
-            api_name="text2audio",
+            api_name="text2audio_gradio",
         )
-
-        #share_button.click(None, [], [], _js=share_js)
-        #gr.Button("Share to community", elem_id="share-btn", visible=False, onclick=share_js)
 
         share_button = gr.Button("Share to community", elem_id="share-btn", visible=False)
         share_button.click(None, [], [])
@@ -306,6 +356,7 @@ with iface:
         </div>
         """
         )
+        # Gradio examples also need to handle the multiple returns
         gr.Examples(
             [
                 [
@@ -341,9 +392,8 @@ with iface:
                     default_checkpoint,
                 ],
             ],
-            fn=text2audio,
+            fn=lambda *args: text2audio(*args)[2], # Only pass the gradio_output_waveform to Gradio UI
             inputs=[textbox, duration, guidance_scale, seed, n_candidates, model_name],
-            # inputs=[textbox, guidance_scale, seed, n_candidates],
             outputs=[outputs],
             cache_examples=True,
         )
@@ -363,18 +413,18 @@ with iface:
                 """
                 <div class="acknowledgments">
                     <p> We build the model with data from <a href="http://research.google.com/audioset/">AudioSet</a>, <a href="https://freesound.org/">Freesound</a> and <a href="https://sound-effects.bbcrewind.co.uk/">BBC Sound Effect library</a>. We share this demo based on the <a href="https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/375954/Research.pdf">UK copyright exception</a> of data for academic research. </p>
-                            </div>
-                        """
+                                </div>
+                            """
             )
-# <p>This demo is strictly for research demo purpose only. For commercial use please <a href="haoheliu@gmail.com">contact us</a>.</p>
-#iface.set_concurrency_limit(3)
 
+# Function to run Flask app in a separate thread
+def run_flask():
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-#iface.queue(concurrency_count=3)
-# iface.launch(debug=True)
-#iface.launch(debug=True, share=True)
+if __name__ == "__main__":
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
 
-#iface.launch(debug=True, share=True, max_concurrency=3)
-
-iface.launch(debug=True, share=True)
-
+    # Launch Gradio UI
+    iface.launch(debug=True, share=True)
